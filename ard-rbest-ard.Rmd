@@ -1,0 +1,221 @@
+---
+title: "Example of reading & writing to ARD"
+output: github_document
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+This is an example of: 
+
+* selecting (i.e. a query) from an analysis results database an endpoint from three clinical studies for the PBO arm,
+* generating a historical control,
+* writing the estimates from the MAP prior back to the ARD database. 
+
+## Set up
+Load the required packages and path to a CSV file containing the analysis dataset using a mock data model. 
+
+TODO: The model is not yet broken down by entity-relationship. 
+
+```{r setup}
+library(knitr)
+library(tidyverse)
+library(RBesT)
+library(RSQLite)  ## require an updated version fix column order bug when appending 
+library(DBI)
+path_to_data <- "./data/ARD-example.csv"
+ARD <- read.csv(path_to_data)
+```
+
+## Load dataset in to SQL database
+
+Use RSQLite as a proof of concent. 
+
+Note: need to update the version of RSQlite to address an issue with column ordering when appending back to the database. 
+
+First step, set up sqlite database. 
+
+```{r}
+mydb <- dbConnect(RSQLite::SQLite(), "my-db.sqlite")
+dbDisconnect(mydb)
+unlink("my-db.sqlite")
+mydb <- dbConnect(RSQLite::SQLite(), "")
+dbDisconnect(mydb)
+```
+
+Insert the analysis result data.frame as a table in the database. This table has a lot of duplication that can be simplified by fully modelling the entity-relationships. 
+
+```{r}
+mydb <- dbConnect(RSQLite::SQLite(), "")
+dbWriteTable(mydb, "ARD", ARD)
+```
+
+Display the column names in the table as a sanity check. 
+
+```{r}
+dbListTables(mydb)
+```
+
+
+Also display the first five rows of the new ARD table. 
+
+```{r}
+dbGetQuery(mydb, 'SELECT * FROM ARD LIMIT 5')
+```
+
+## Query the database
+
+Now we can query database. 
+
+We want to query for studies that have: 
+
+* an outcome "PCE" which is short for "Primary composite endpoint", 
+* the analysis is "descriptive" (ANALYTYP1 = DESCRIPTIVE""),
+* and a placebo treatment arm (TRTVAL = PBO),
+* return the selected data and write to dataframe,
+* and transform ready for RBesT,
+* display a glimpse of the df structure to ensure this worked. 
+
+```{r}
+df <- dbGetQuery(mydb, 'SELECT STUDYID, TRTVAL, STAT, STATVAL FROM ARD WHERE PARAMCD = "PCE" AND ANALTYP1 = "DESCRIPTIVE" AND TRTVAL = "PBO" ') %>%
+  group_by(STUDYID, TRTVAL, STAT) %>%
+   mutate(id = row_number()) %>% 
+   gather(groupname, value, -id, -STUDYID, -TRTVAL, -STAT) %>%
+   spread(STAT, value) %>%
+   select(TRTVAL, N, n) %>%  
+   glimpse()
+  
+```
+
+## MAP prior of three studies using RBesT
+
+We run the placebo arm through RBest to generate a MAP prior. Note: we are just using the default settings without any thought to make sure the data is in the correct format. 
+
+```{r}
+set.seed(34563)
+map_mcmc <- gMAP(cbind(n, N-n) ~ 1 | STUDYID,
+                 data=df,
+                 tau.dist="HalfNormal",
+                 tau.prior=1,
+                 beta.prior=2,
+                 family=binomial)
+```
+
+
+Print the output of the model. 
+
+```{r}
+print(map_mcmc)
+```
+
+Check that a graphical representation of model checks is available
+```{r}
+pl <- plot(map_mcmc)
+```
+
+Check that a number of plots are immediately defined
+```{r}
+names(pl)
+```
+
+Display the forest plot with model estimates 
+```{r}
+print(pl$forest_model)
+```
+
+## Arrange data and write back to the db 
+
+Now we need to arrange the data into a format that can be inserted back in to the database. 
+
+To do so we:
+
+* Map the output to datatable ARD schema (NOTE: this is very manual at the moment),
+* gather the statistics from the three mcmc chains into seperate analyes
+* give each analysis its own unique id
+* indicate that the analysis comes from three rather than one study. 
+
+
+
+```{r}
+map <- as_tibble(map_mcmc$theta.strat) %>%
+  mutate(
+    ANALID = row_number(),
+    STUDYID = "123",
+    UANALID = paste0(STUDYID, ".", ANALID),
+    ANALFLG = "FAS",
+    TRTVAR = "treatment",
+    TRTVAL = "PBO",
+    SUBVAR = "",
+    SUBVAL = "",
+    AVISTN = "EOS",
+    ANALMETH = "MAP prior",
+    PARAM	= "Primary composite outcome: CVD or FHFH",
+    PARAMCD	= "PCE",
+    ROWCAT1 = "ROWCAT1",
+    ANALTYP1 = "PREDICTIVE",
+    ANALTYP2 = "",
+    ANALDESCRIPTION = "RBesT MAP Prior PBO from study 1, 2 and 3"
+  ) %>%
+  gather(
+    "STAT",
+    "STATVAL",-UANALID,
+    -STUDYID,
+    -ANALID,
+    -ANALFLG,
+    -TRTVAR,
+    -TRTVAL,
+    -SUBVAR,
+    -SUBVAL,
+    -AVISTN,
+    -PARAM,
+    -PARAMCD,
+    -ROWCAT1,
+    -ANALTYP1,
+    -ANALTYP2,
+    -ANALMETH,
+    -ANALDESCRIPTION
+  ) %>%
+  glimpse()
+
+```
+
+Check that the data.frame maps to the ARD schema by displaying the columns in table ARD. 
+
+```{r}
+dbListFields(mydb, "ARD") 
+```
+
+## Append to database
+
+Now we write back to the database appending to the table. 
+
+
+```{r}
+dbWriteTable(mydb, "ARD", map, append = TRUE)
+
+```
+
+
+We then check that the data from the new analysis is there. 
+
+```{r}
+dbGetQuery(mydb, 'SELECT * FROM ARD WHERE PARAMCD = "PCE" AND ANALTYP1 = "PREDICTIVE" AND TRTVAL = "PBO" ')
+```
+
+Disconnect the database. 
+
+```{r}
+dbDisconnect(mydb)
+```
+
+
+## Session info
+```{r}
+sessionInfo()
+```
+
+

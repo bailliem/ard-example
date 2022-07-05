@@ -1,0 +1,150 @@
+---
+  title: "Query CDISC ADAE"
+  output: github_document
+---
+
+  
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(tidyverse)
+library(here)
+library(RSQLite)
+library(dbplyr)  ## may need to update dbplyr 
+library(DBI)
+```
+
+
+Load example CDISC data from [https://github.com/phuse-org/phuse-scripts](https://github.com/phuse-org/phuse-scripts).
+
+```{r}
+adsl <- haven::read_xpt(here("data","adsl.xpt"))
+adae <- haven::read_xpt(here("data","adae.xpt"))
+```
+
+Calculate the number of patients by treatment in the safety population (SAFFL). NOTE: All of these steps to generate summary statistics could be performed within a database using SQL. 
+
+```{r}
+bigN <- adae %>%
+  filter(SAFFL == "Y") %>% ## SAF population
+  group_by(TRTA) %>%
+  summarise(N = n()) %>%
+  mutate(N = N)
+
+```
+
+Calculate the number of patients by treatment assigned by adverse event (dictionary dervived term). 
+
+```{r}
+smalln <- adae %>% 
+  filter(SAFFL == "Y") %>% ## SAF population
+  group_by(AEDECOD, TRTA) %>% # group by PT - disctionary dervived term and trt
+  summarise(n = n()) %>%
+  mutate(n = n) 
+
+```
+
+Finally, calculate the percentage of events by derived term i.e. the treatment emergent adverse events. 
+
+```{r}
+teae <- bigN %>%
+  left_join(smalln) %>%
+  mutate(inc = n / N, 
+         per = n / N * 100) %>%
+  arrange(TRTA, AEDECOD) %>% 
+  glimpse()
+```
+
+
+## Database
+
+
+```{r}
+ARD <- teae %>%
+  mutate(
+    ANALID = row_number(),
+    STUDYID = "1",
+    UANALID = paste0(STUDYID, ".", ANALID),
+    ANALFLG = "SAFFL",
+    TRTVAR = "TRTA",
+    TRTVAL = TRTA,
+    SUBVAR = "",
+    SUBVAL = "",
+    AVISTN = "EOS",
+    ANALMETH = "Summary statistics",
+    PARAM	= "treatment emergent adverse event (dictionary dervived term)",
+    PARAMCD	= "TEAE" ,
+    ROWCAT1 = AEDECOD,
+    ANALTYP1 = "DESCRIPTIVE",
+    ANALTYP2 = "",
+    ANALDESCRIPTION = "Descriptive summary of treatment emergent adverse events by treatment."
+  ) %>%
+  select(-AEDECOD, -TRTA) %>%
+  gather(
+    "STAT",
+    "STATVAL",
+    -UANALID,
+    -STUDYID,
+    -ANALID,
+    -ANALFLG,
+    -TRTVAR,
+    -TRTVAL,
+    -SUBVAR,
+    -SUBVAL,
+    -AVISTN,
+    -PARAM,
+    -PARAMCD,
+    -ROWCAT1,
+    -ANALTYP1,
+    -ANALTYP2,
+    -ANALMETH,
+    -ANALDESCRIPTION
+  ) %>%
+  arrange(STUDYID, ANALID, STAT) %>%
+  glimpse()
+```
+
+
+Write to a database the results. 
+
+
+
+
+```{r}
+mydb <- dbConnect(RSQLite::SQLite(), "")
+dbWriteTable(mydb, "ARD", ARD)
+```
+
+```{r}
+dbListTables(mydb)
+```
+
+```{r}
+dbListFields(mydb, "ARD") 
+```
+
+Query the database for AEs with an incidence over 5%. 
+
+
+```{r}
+dbdata <- tbl(mydb, "ARD")
+dbdata %>%
+  filter(ANALTYP1 == "DESCRIPTIVE" &  PARAMCD == "TEAE" & STAT == "inc" && STATVAL > 0.05 ) %>%
+  select(ANALID, TRTVAL, ROWCAT1, STAT, STATVAL) 
+```
+
+Disconnect the database. 
+
+```{r}
+dbDisconnect(mydb)
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
